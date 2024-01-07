@@ -1,29 +1,23 @@
 #!/usr/bin/env python
-#    Licensed under the Apache License, Version 2.0 (the "License"); you may
-#    not use this file except in compliance with the License. You may obtain
-#    a copy of the License at
 #
-#         http://www.apache.org/licenses/LICENSE-2.0
+# SPDX-License-Identifier: BSD-3-Clause
 #
-#    Unless required by applicable law or agreed to in writing, software
-#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#    License for the specific language governing permissions and limitations
-#    under the License.
 
 import argparse
 import io
+import json
 import logging
-import pprint
+import os
 import textwrap
+import re
 
 import jinja2
 import requests
 
 LOG = logging.getLogger(__name__)
 
-REDFISH_SCHEMA_BASE = 'http://redfish.dmtf.org/schemas/v1/'
-SWORDFISH_SCHEMA_BASE = 'http://redfish.dmtf.org/schemas/swordfish/v1/'
+REDFISH_SCHEMA_BASE = 'https://redfish.dmtf.org/schemas/v1/'
+SWORDFISH_SCHEMA_BASE = 'https://redfish.dmtf.org/schemas/swordfish/v1/'
 
 COMMON_NAME_CHANGES = {
     'Oem': 'OEM',
@@ -42,7 +36,12 @@ COMMON_DESC = {
 }
 
 
-def _format_comment(name, description, cutpoint='used', add=' is'):
+def _ident(name):
+    """Gets an identifying name that has been cleaned up from the raw name."""
+    return re.sub(r'[^a-zA-Z0-9]', r'', name)
+
+
+def _format_comment(name, description, cutpoint='shall', add=''):
     if name in COMMON_DESC:
         return '// %s' % COMMON_DESC[name]
 
@@ -50,22 +49,31 @@ def _format_comment(name, description, cutpoint='used', add=' is'):
         cutpoint = ''
 
     lines = textwrap.wrap(
-        '%s%s %s' % (name, add, description[description.index(cutpoint):]))
-    return '\n'.join([('// %s' % l) for l in lines])
+        '%s%s %s' % (name, add, description[description.index(cutpoint):]), 112)
+    return '\n'.join([('// %s' % line) for line in lines])
 
 
 def _get_desc(obj):
     desc = obj.get('longDescription')
     if not desc:
         desc = obj.get('description', '')
-    return desc
+    desc = re.sub(r'`', "'", desc)
+    return re.sub(r'( ){2,}', ' ', desc)
+
+
+def _get_enum_dec(name, obj):
+    desc = obj.get('enumLongDescriptions', {}).get(name)
+    if not desc:
+        desc = obj.get('enumDescriptions', {}).get(name, '')
+    desc = re.sub(r'`', "'", desc)
+    return re.sub(r'( ){2,}', ' ', desc)
 
 
 def _get_type(name, obj):
     result = 'string'
     tipe = obj.get('type')
     anyof = obj.get('anyOf') or obj.get('items', {}).get('anyOf')
-    if 'count' in name.lower():
+    if name.lower().endswith('count'):
         result = 'int'
     elif name == 'Status':
         result = 'common.Status'
@@ -73,14 +81,20 @@ def _get_type(name, obj):
         result = 'common.Identifier'
     elif name == 'Description':
         result = 'string'
+    elif name == 'UUID':
+        result = 'string'
+    elif name == 'Oem':
+        result = 'json.RawMessage'
     elif tipe == 'object':
         result = name
     elif isinstance(tipe, list):
         for kind in tipe:
             if kind == 'null':
                 continue
-            if kind == 'integer' or kind == 'number':
+            if kind == 'integer':
                 result = 'int'
+            elif kind == 'number':
+                result = 'float64'
             elif kind == 'boolean':
                 result = 'bool'
             else:
@@ -96,7 +110,7 @@ def _get_type(name, obj):
 
     if tipe == 'array':
         result = '[]' + result
-    
+
     if 'odata' in name or name in COMMON_NAME_CHANGES:
         result = '%s `json:"%s"`' % (result, name)
 
@@ -107,11 +121,16 @@ def _add_object(params, name, obj):
     """Adds object information to our template parameters."""
     class_info = {
         'name': name,
-        'description': _format_comment(name, _get_desc(obj)),
-        'attrs': []}
+        'identname': _ident(name),
+        'description': _format_comment(name, _get_desc(obj), cutpoint='shall', add=''),
+        'isEntity': False,
+        'attrs': [],
+        'rwAttrs': []
+    }
 
     for prop in obj.get('properties', []):
-        if prop in ['Name', 'Id']:
+        if prop in ['Name', 'Id', '@odata.id']:
+            class_info['isEntity'] = True
             continue
         prawp = obj['properties'][prop]
         if prawp.get('deprecated'):
@@ -129,26 +148,42 @@ def _add_object(params, name, obj):
         attr['description'] = _format_comment(
             prop, _get_desc(prawp))
         class_info['attrs'].append(attr)
+        if not prawp.get('readonly', True):
+            class_info['rwAttrs'].append(attr['name'])
     params['classes'].append(class_info)
 
 
 def _add_enum(params, name, enum):
-    """Adds enum information to our template parameteres."""
+    """Adds enum information to our template parameters."""
     enum_info = {
         'name': name,
-        'description': _format_comment(name, _get_desc(enum)),
+        'identname': _ident(name),
+        'description': _format_comment(_ident(name), _get_desc(enum), cutpoint='', add=' is'),
         'members': []}
 
     for en in enum.get('enum', []):
-        member = {'name': en}
-        if enum.get('enumLongDescriptions', {}).get(en):
-            desc = enum.get('enumLongDescriptions', {}).get(en)
-        else:
-            desc = enum.get('enumDescriptions', {}).get(en, '')
+        member = {'identname': _ident(en), 'name': en}
+        desc = _get_enum_dec(en, enum)
         member['description'] = _format_comment(
-            '%s%s' % (en, name), desc, cutpoint='shall', add='')
+            '%s%s' % (_ident(en), name), desc, cutpoint='shall', add='')
         enum_info['members'].append(member)
     params['enums'].append(enum_info)
+
+
+def _get_json_data(url):
+    if 'http' in url:
+        data = requests.get(url)
+
+        try:
+            return data.json()
+        except Exception:
+            LOG.exception('Error with data:\n%s' % data)
+            return None
+    else:
+        with open(url, 'r') as schema_file:
+            data = schema_file.read()
+        if data:
+            return json.loads(data)
 
 
 def main():
@@ -166,11 +201,17 @@ def main():
         help='Define the object type and go package')
     parser.add_argument(
         '-o',
-        '--output-file',
+        '--outputfile',
         help='File to write results to. Default is to stdout.')
     parser.add_argument(
         '-v', '--verbose', action='store_true',
         help='Emit verbose output to help debug.')
+    parser.add_argument(
+        '-l',
+        '--localpath',
+        default=None,
+        help='Local path to schema files'
+    )
 
     args = parser.parse_args()
 
@@ -181,15 +222,16 @@ def main():
     else:
         raise NameError("Unknown schema type")
 
+    if args.localpath:
+        url = '%s.json' % os.path.join(args.localpath, args.object)
+
     LOG.debug(url)
 
-    data = requests.get(url)
-    try:
-        base_data = data.json()
-    except Exception:
-        LOG.exception('Error with data:\n%s' % data)
-        return
+    base_data = _get_json_data(url)
 
+    # Get the most recent versioned schema from the base
+    version_url = ''
+    major, minor, errata = 0, 0, 0
     for classdef in base_data.get('definitions', []):
         if classdef == args.object:
             refs = base_data['definitions'][classdef].get('anyOf', [])
@@ -198,12 +240,28 @@ def main():
                 if 'idRef' in reflink:
                     continue
                 refurl = reflink.split('#')[0]
-                if refurl > url:
-                    url = refurl
+                refver = re.search(r'v(\d+_\d+_\d+)', refurl)
+                if refver:
+                    ver = refver.group(1).split('_')
+                    mjr, mnr, ert = int(ver[0]), int(ver[1]), int(ver[2])
+                    if mjr > major or mnr > minor or ert > errata:
+                        version_url = refurl
+                        major, minor, errata = mjr, mnr, ert
             break
 
-    object_data = requests.get(url).json()
-    params = {'object_name': args.object, 'classes': [], 'enums': [], 'package': args.type}
+    if version_url:
+        if args.localpath:
+            version_url = '%s/%s' % (
+                args.localpath, version_url.split('/')[-1])
+        url = version_url
+
+    object_data = _get_json_data(url)
+    params = {
+        'object_name': args.object,
+        'classes': [],
+        'enums': [],
+        'package': args.type
+    }
 
     for name in object_data['definitions']:
         if name == 'Actions':
@@ -212,17 +270,26 @@ def main():
         if definition.get('type') == 'object':
             properties = definition.get('properties', '')
             if not ('target' in properties and 'title' in properties):
-                _add_object(params, name, definition)
+                _add_object(params, _ident(name), definition)
         elif definition.get('enum'):
-            _add_enum(params, name, definition)
+            _add_enum(params, _ident(name), definition)
         else:
             LOG.debug('Skipping %s', definition)
 
-    with io.open('source.go', 'r', encoding='utf-8') as f:
+    with io.open('source.tmpl', 'r', encoding='utf-8') as f:
         template_body = f.read()
 
-    template = jinja2.Template(template_body)
-    print(template.render(**params))
+    if template_body:
+        # Write out the generated content
+        outfile = None
+        if args.outputfile:
+            outfile = open(args.outputfile.lower(), 'w')
+
+        template = jinja2.Template(template_body)
+        print(template.render(**params), file=outfile, flush=True)
+
+        if outfile:
+            outfile.close()
 
 
 if __name__ == '__main__':
