@@ -182,7 +182,8 @@ type ComponentIntegrity struct {
 	rawData                         []byte
 	SPDMGetSignedMeasurementsTarget string
 	TPMGetSignedMeasurementsTarget  string
-	componentsProtected             []string
+	// An array of links to resources that the target component (TargetComponentURI) protects, excluding TargetComponentURI itself.
+	ComponentsProtected []string
 	// ComponentsProtectedCount is the number of resources protected by the component identified by TargetComponentURI.
 	ComponentsProtectedCount int
 }
@@ -218,7 +219,7 @@ func (componentintegrity *ComponentIntegrity) UnmarshalJSON(b []byte) error {
 	// Extract the links to other entities for later
 	componentintegrity.SPDMGetSignedMeasurementsTarget = t.Actions.SPDMGetSignedMeasurements.Target
 	componentintegrity.TPMGetSignedMeasurementsTarget = t.Actions.TPMGetSignedMeasurements.Target
-	componentintegrity.componentsProtected = t.Links.ComponentsProtected.ToStrings()
+	componentintegrity.ComponentsProtected = t.Links.ComponentsProtected.ToStrings()
 	componentintegrity.ComponentsProtectedCount = t.Links.ComponentsProtectedCount
 
 	// This is a read/write object, so we need to save the raw object data for later
@@ -327,10 +328,10 @@ func (spdmgetsignedmeasurementsresponse *SPDMGetSignedMeasurementsResponse) setC
 // SPDMGetSignedMeasurements generates an SPDM cryptographic signed statement over the given nonce and measurements of the SPDM Responder.
 func (componentintegrity *ComponentIntegrity) SPDMGetSignedMeasurements(request *SPDMGetSignedMeasurementsRequest) (*SPDMGetSignedMeasurementsResponse, *Task, error) {
 	resp, err := componentintegrity.PostWithResponse(componentintegrity.SPDMGetSignedMeasurementsTarget, request)
+	defer common.DeferredCleanupHTTPResponse(resp)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer resp.Body.Close()
 
 	// Return Task if applicable
 	if resp.StatusCode == http.StatusAccepted {
@@ -353,10 +354,10 @@ func (componentintegrity *ComponentIntegrity) SPDMGetSignedMeasurements(request 
 // TPMGetSignedMeasurements generates a TPM cryptographic signed statement over the given nonce and PCRs of the TPM for TPM 2.0 devices.
 func (componentintegrity *ComponentIntegrity) TPMGetSignedMeasurements(request *TPMGetSignedMeasurementsRequest) (*TPMGetSignedMeasurementsResponse, error) {
 	resp, err := componentintegrity.PostWithResponse(componentintegrity.TPMGetSignedMeasurementsTarget, request)
+	defer common.DeferredCleanupHTTPResponse(resp)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	var response TPMGetSignedMeasurementsResponse
 	err = json.NewDecoder(resp.Body).Decode(&response)

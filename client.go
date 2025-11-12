@@ -101,6 +101,9 @@ type ClientConfig struct {
 	// ReuseConnections can be useful if executing a lot of requests. Setting to `true` allows
 	// the TCP sessions to remain open and reused betweeen subsequent calls.
 	ReuseConnections bool
+
+	// NoModifyTransport if set indicates that the API client won't attempt to make any changes to the transport
+	NoModifyTransport bool
 }
 
 // setupClientWithConfig setups the client using the client config
@@ -139,8 +142,9 @@ func setupClientWithConfig(ctx context.Context, config *ClientConfig) (c *APICli
 	client.HTTPClient = config.HTTPClient
 
 	// if the provided HTTPClient uses a standard Transport, we want to
-	// amend its configuration to match what was provided to us
-	if transport, ok := client.HTTPClient.Transport.(*http.Transport); ok {
+	// amend its configuration to match what was provided to us if the user allows it.
+	// otherwise we'll rely on the user to configure the transport as they claim it's configured.
+	if transport, ok := client.HTTPClient.Transport.(*http.Transport); ok && !config.NoModifyTransport {
 		if config.Insecure {
 			// If we're using the default transport, need to make sure there
 			// is a TLSClientConfig set in order to set the SkipVerify flag.
@@ -272,6 +276,16 @@ func (c *APIClient) GetService() *Service {
 func (c *APIClient) WithContext(ctx context.Context) *APIClient {
 	newClient := *c
 	newClient.ctx = ctx
+
+	// clone the service onto the new client so that any requests against it use the proper client
+	newService := Service{}
+	if newClient.Service != nil {
+		newService = *newClient.Service
+	}
+
+	newClient.Service = &newService
+	newClient.Service.SetClient(&newClient)
+
 	return &newClient
 }
 
@@ -390,11 +404,9 @@ func (c *APIClient) Delete(url string) (*http.Response, error) {
 // DeleteWithHeaders performs a Delete request against the Redfish service but allowing custom headers
 func (c *APIClient) DeleteWithHeaders(url string, customHeaders map[string]string) (*http.Response, error) {
 	resp, err := c.runRequestWithHeaders(http.MethodDelete, url, nil, customHeaders)
+	defer common.DeferredCleanupHTTPResponse(resp)
 	if err != nil {
 		return nil, err
-	}
-	if resp != nil && resp.Body != nil {
-		resp.Body.Close()
 	}
 	return resp, nil
 }
@@ -564,17 +576,17 @@ func (c *APIClient) runRawRequestWithHeaders(method, url string, payloadBuffer i
 	// Dump response if needed.
 	if c.dumpWriter != nil {
 		if err := c.dumpResponse(resp); err != nil {
-			defer resp.Body.Close()
+			defer common.DeferredCleanupHTTPResponse(resp)
 			return nil, err
 		}
 	}
 
 	if resp.StatusCode != 200 && resp.StatusCode != 201 && resp.StatusCode != 202 && resp.StatusCode != 204 {
+		defer common.DeferredCleanupHTTPResponse(resp)
 		payload, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, common.ConstructError(0, []byte(err.Error()))
 		}
-		defer resp.Body.Close()
 		return nil, common.ConstructError(resp.StatusCode, payload)
 	}
 
