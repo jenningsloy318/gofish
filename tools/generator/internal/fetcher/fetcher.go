@@ -6,17 +6,16 @@ package fetcher
 
 import (
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 const (
-	RedfishGitRepo      = "https://github.com/DMTF/Redfish-Publications.git"
-	SwordfishSchemaBase = "https://redfish.dmtf.org/schemas/swordfish/v1/"
+	RedfishGitRepo   = "https://github.com/DMTF/Redfish-Publications.git"
+	SwordfishGitRepo = "https://github.com/SNIA/Swordfish-Publications.git"
 )
 
 // Fetcher handles downloading schemas
@@ -49,23 +48,37 @@ func (f *Fetcher) GetTempDir() string {
 	return f.tempDir
 }
 
-// FetchRedfish fetches Redfish schemas by shallow cloning the repository
+// FetchRedfish fetches Redfish schemas by shallow cloning the repository at the latest release tag.
 func (f *Fetcher) FetchRedfish() (string, error) {
-	redfishDir := filepath.Join(f.tempDir, "redfish")
+	return f.cloneAndFindSchemas("redfish", RedfishGitRepo, func(tag string) bool { return true })
+}
 
-	// Shallow clone the repository
-	cmd := exec.Command("git", "clone", "--depth", "1", RedfishGitRepo, redfishDir)
-	output, err := cmd.CombinedOutput()
+// FetchSwordfish fetches Swordfish schemas by shallow cloning the repository at the latest official release tag.
+func (f *Fetcher) FetchSwordfish() (string, error) {
+	return f.cloneAndFindSchemas("swordfish", SwordfishGitRepo, func(tag string) bool {
+		return strings.HasSuffix(tag, "_Release")
+	})
+}
+
+// cloneAndFindSchemas finds the latest tag satisfying tagFilter, shallow-clones
+// the repository at that tag, and returns the path to the json-schema directory.
+func (f *Fetcher) cloneAndFindSchemas(name, repoURL string, tagFilter func(string) bool) (string, error) {
+	tag, err := latestTag(repoURL, tagFilter)
 	if err != nil {
-		return "", fmt.Errorf("failed to clone Redfish repository: %w\n%s", err, string(output))
+		return "", fmt.Errorf("failed to determine latest tag for %s: %w", name, err)
 	}
 
-	// Find the json-schema directory
-	// The structure is usually DMTF/Redfish-Publications/json-schema/
-	schemaDir := filepath.Join(redfishDir, "json-schema")
+	cloneDir := filepath.Join(f.tempDir, name)
+
+	cmd := exec.Command("git", "clone", "--depth", "1", "--branch", tag, repoURL, cloneDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to clone %s repository: %w\n%s", name, err, string(output))
+	}
+
+	schemaDir := filepath.Join(cloneDir, "json-schema")
 	if _, err := os.Stat(schemaDir); err != nil {
-		// Try to find it in subdirectories
-		matches, _ := filepath.Glob(filepath.Join(redfishDir, "*/json-schema"))
+		matches, _ := filepath.Glob(filepath.Join(cloneDir, "*/json-schema"))
 		if len(matches) > 0 {
 			schemaDir = matches[0]
 		} else {
@@ -76,86 +89,33 @@ func (f *Fetcher) FetchRedfish() (string, error) {
 	return schemaDir, nil
 }
 
-// FetchSwordfish fetches Swordfish schemas by downloading files
-func (f *Fetcher) FetchSwordfish() (string, error) {
-	swordfishDir := filepath.Join(f.tempDir, "swordfish")
-	if err := os.MkdirAll(swordfishDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create swordfish directory: %w", err)
-	}
-
-	// Get the index page to find all JSON files
-	resp, err := http.Get(SwordfishSchemaBase)
+// latestTag returns the lexicographically last tag from the remote repository
+// that satisfies filter. Tags are listed via git ls-remote without requiring a
+// local clone.
+func latestTag(repoURL string, filter func(string) bool) (string, error) {
+	cmd := exec.Command("git", "ls-remote", "--tags", "--refs", repoURL)
+	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch swordfish index: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response: %w", err)
+		return "", fmt.Errorf("failed to list remote tags: %w", err)
 	}
 
-	// Parse HTML to find .json files (simple approach)
-	content := string(body)
-	files := extractJSONFiles(content)
-
-	// Download each file
-	for _, file := range files {
-		if err := f.downloadFile(SwordfishSchemaBase+file, filepath.Join(swordfishDir, file)); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to download %s: %v\n", file, err)
+	var tags []string
+	for line := range strings.SplitSeq(strings.TrimSpace(string(output)), "\n") {
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		tag := strings.TrimPrefix(parts[1], "refs/tags/")
+		if filter(tag) {
+			tags = append(tags, tag)
 		}
 	}
 
-	return swordfishDir, nil
-}
-
-// downloadFile downloads a file from a URL to a local path
-func (f *Fetcher) downloadFile(url, filepath string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bad status: %s", resp.Status)
+	if len(tags) == 0 {
+		return "", fmt.Errorf("no matching tags found in %s", repoURL)
 	}
 
-	out, err := os.Create(filepath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	return err
-}
-
-// extractJSONFiles extracts JSON file names from HTML content
-func extractJSONFiles(html string) []string {
-	var files []string
-
-	// Simple parsing - look for .json files in href attributes
-	lines := strings.SplitSeq(html, "\n")
-	for line := range lines {
-		if strings.Contains(line, ".json") {
-			// Extract href="filename.json"
-			start := strings.Index(line, "href=\"")
-			if start == -1 {
-				continue
-			}
-			start += 6
-			end := strings.Index(line[start:], "\"")
-			if end == -1 {
-				continue
-			}
-			filename := line[start : start+end]
-			if strings.HasSuffix(filename, ".json") && !strings.Contains(filename, "/") {
-				files = append(files, filename)
-			}
-		}
-	}
-
-	return files
+	sort.Strings(tags)
+	return tags[len(tags)-1], nil
 }
 
